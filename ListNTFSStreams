@@ -1,0 +1,198 @@
+// ListNTFSStreams.cpp : This file contains the 'main' function. Program execution begins and ends there.
+//
+
+#include <windows.h>
+#include <stdio.h>
+#include <unordered_map>
+
+#define DEBUG_FORMAT_MSG						   \
+	char buffer[1024];								\
+	va_list args;									\
+	va_start(args, msg);							\
+	vsnprintf(buffer, sizeof(buffer), msg, args);	\
+	va_end(args);
+
+void PrintError(const char *msg, ...)
+{
+	DWORD dwLastErr = GetLastError();
+	
+	LPTSTR errorText = NULL;
+	FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+		   NULL, dwLastErr, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+		(LPTSTR)&errorText, 0, NULL);
+
+	DEBUG_FORMAT_MSG
+	printf("%s: LastError = Code:[%lu] Msg:[%s] \n", buffer, dwLastErr, errorText);
+}
+
+
+
+void enableprivs()
+{
+	HANDLE hToken;
+	byte buf[sizeof TOKEN_PRIVILEGES * 2];
+	TOKEN_PRIVILEGES & tkp = *((TOKEN_PRIVILEGES *)buf);
+
+	if (!OpenProcessToken(GetCurrentProcess(),
+		TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+		PrintError("OpenProcessToken failed");
+
+	if (!LookupPrivilegeValue(NULL, SE_BACKUP_NAME, &tkp.Privileges[0].Luid))
+		PrintError("LookupPrivilegeValue SE_BACKUP_NAME failed");
+
+	if (!LookupPrivilegeValue(NULL, SE_RESTORE_NAME, &tkp.Privileges[1].Luid))
+		PrintError("LookupPrivilegeValue SE_RESTORE_NAME failed");
+
+	tkp.PrivilegeCount = 2;
+	tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+	tkp.Privileges[1].Attributes = SE_PRIVILEGE_ENABLED;
+
+	AdjustTokenPrivileges(hToken, FALSE, &tkp, sizeof tkp,
+		NULL, NULL);
+}
+
+std::unordered_map<DWORD, std::string> StreamIdToStr =
+{
+	{BACKUP_INVALID, "BACKUP_INVALID"},
+	{BACKUP_DATA, "BACKUP_DATA"},
+	{BACKUP_EA_DATA, "BACKUP_EA_DATA"},
+	{BACKUP_SECURITY_DATA, "BACKUP_SECURITY_DATA"},
+	{BACKUP_ALTERNATE_DATA, "BACKUP_ALTERNATE_DATA"},
+	{BACKUP_LINK, "BACKUP_LINK"},
+	{BACKUP_PROPERTY_DATA, "BACKUP_PROPERTY_DATA"},
+	{BACKUP_OBJECT_ID, "BACKUP_OBJECT_ID"},
+	{BACKUP_REPARSE_DATA, "BACKUP_REPARSE_DATA"},
+	{BACKUP_SPARSE_BLOCK, "BACKUP_SPARSE_BLOCK"},
+	{BACKUP_TXFS_DATA, "BACKUP_TXFS_DATA"}
+};
+
+void PrintStreamHdr(WIN32_STREAM_ID & wsi)
+{
+	const char *p;
+
+	/*printf("\n named stream [%lu] \"%S\":\n", wsi.dwStreamNameSize,
+		wsi.dwStreamNameSize ? wsi.cStreamName : L"");*/
+	switch (wsi.dwStreamId)
+	{
+	case BACKUP_DATA:
+		p = "BACKUP_DATA";
+		break;
+	case BACKUP_EA_DATA:
+		p = "BACKUP_EA_DATA";
+		break;
+	case BACKUP_SECURITY_DATA:
+		p = "BACKUP_SECURITY_DATA";
+		break;
+	case BACKUP_ALTERNATE_DATA:
+		p = "BACKUP_ALTERNATE_DATA";
+		break;
+	case BACKUP_LINK:
+		p = "BACKUP_LINK";
+		break;
+	case BACKUP_PROPERTY_DATA:
+		p = "BACKUP_PROPERTY_DATA";
+		break;
+	case BACKUP_OBJECT_ID:
+		p = "BACKUP_OBJECT_ID";
+		break;
+	case BACKUP_REPARSE_DATA:
+		p = "BACKUP_REPARSE_DATA";
+		break;
+	case BACKUP_SPARSE_BLOCK:
+		p = "BACKUP_SPARSE_BLOCK";
+		break;
+	case BACKUP_TXFS_DATA:
+		p = "BACKUP_TXFS_DATA";
+		break;
+	default:
+		p = "unknown";
+		break;
+	}
+	printf("Stream type: %s\n", p);
+	printf("  size: %I64d\n", wsi.Size.QuadPart);
+}
+
+
+
+int main(int argc, char *argv[])
+{
+	HANDLE fh;
+
+	if (argc != 2)
+	{
+		printf("usage: dump_ntfs_streams {file}\n");
+		return 1;
+	}
+
+	// SeBackupPrivilege is not necessary to enumerate streams --
+	// but it helps if you are an admin/backup-operator and need
+	// to scan files to which you have no permissions
+	enableprivs();
+
+	fh = CreateFile(argv[1], GENERIC_READ, 0, NULL, OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+	if (fh == INVALID_HANDLE_VALUE || fh == NULL)
+	{
+		PrintError("CreateFile failed");
+		return 0;
+	}
+
+	byte buf[8192];
+	DWORD numread, numtoskip;
+	void *ctx = NULL;
+	WIN32_STREAM_ID & oStreamId = *((WIN32_STREAM_ID *)buf);
+
+	numtoskip = 0;
+	while (1)
+	{
+		// we are at the start of a stream header. read it.
+		if (!BackupRead(fh, buf, 20, &numread, FALSE, TRUE, &ctx))
+		{
+			PrintError("BackupRead failed, streamid=[%s]", StreamIdToStr[oStreamId.dwStreamId].c_str());
+			break;
+		}
+
+		if (numread == 0)
+			break;
+
+		if (oStreamId.dwStreamNameSize > 0)
+		{
+			if (!BackupRead(fh, buf + 20, oStreamId.dwStreamNameSize, &numread, FALSE, TRUE, &ctx))
+			{
+				PrintError("BackupRead failed, streamid=[%s]", StreamIdToStr[oStreamId.dwStreamId].c_str());
+				break;
+			}
+
+			if (numread != oStreamId.dwStreamNameSize)
+				break;
+		}
+
+		PrintStreamHdr(oStreamId);
+
+		// skip stream data
+		if (oStreamId.Size.QuadPart > 0)
+		{
+			char buf[1024];
+			DWORD bytesRead = 0;
+			DWORD lo, hi;
+			DWORD bytesToRead = min(1024, oStreamId.Size.QuadPart);
+			if (!BackupRead(fh, (LPBYTE)buf, bytesToRead, &bytesRead, FALSE, TRUE, &ctx))
+			{
+				PrintError("BackupRead failed, streamid=[%s]", StreamIdToStr[oStreamId.dwStreamId].c_str());
+				break;
+			}
+
+			LARGE_INTEGER bytesToSeek;
+			bytesToSeek.QuadPart = oStreamId.Size.QuadPart - bytesRead;
+			if (bytesToSeek.QuadPart > 0)
+				BackupSeek(fh, bytesToSeek.LowPart, bytesToSeek.HighPart, &lo, &hi, &ctx);
+		}
+	}
+
+	BackupRead(fh, buf, 0, &numread, TRUE, FALSE, &ctx);
+
+	CloseHandle(fh);
+
+	return 0;
+}
+
